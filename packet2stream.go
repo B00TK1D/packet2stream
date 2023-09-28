@@ -16,7 +16,7 @@ var mongoURI = flag.String("m", "mongodb://localhost:27017", "Mongodb URI")
 var dbName = flag.String("d", "traffic", "Mongodb database name")
 var packetColName = flag.String("c", "packets", "Mongodb collection name for packets")
 var streamColName = flag.String("s", "streams", "Mongodb collection name for streams")
-var streamTimeout = flag.Int64("t", 60*1000000000, "Stream timeout in seconds")
+var streamTimeout = flag.Int64("t", 60, "Stream timeout in seconds")
 
 var ctxTodo = context.TODO()
 
@@ -59,6 +59,7 @@ func createStream(stream Stream, packetId primitive.ObjectID) {
 func main() {
 	// Read in cmd line args
 	flag.Parse()
+	streamTimeoutMilliseconds := *streamTimeout * int64(1000000000)
 
 	// Connect to MongoDB
 	client, err := mongo.Connect(ctxTodo, options.Client().ApplyURI(*mongoURI))
@@ -114,7 +115,7 @@ func main() {
 		tcpflags := packet["tcpflag"].(bson.M)
 		payload = packet["payload"].(primitive.Binary).Data
 
-		streamCursor, err := streamCol.Find(ctxTodo, bson.M{"terminated": false, "clientip": clientIp, "serverip": serverIp, "clientport": clientPort, "serverport": serverPort, "protocol": protocol, "lasttime": bson.M{"$lt": timestamp + *streamTimeout}})
+		streamCursor, err := streamCol.Find(ctxTodo, bson.M{"terminated": false, "clientip": clientIp, "serverip": serverIp, "clientport": clientPort, "serverport": serverPort, "protocol": protocol, "lasttime": bson.M{"$lt": timestamp + streamTimeoutMilliseconds}})
 
 		// If the packet matches an existing stream, update the stream
 		if err == nil {
