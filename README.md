@@ -5,7 +5,7 @@ Read in packets from a mongodb collection and tag them with the stream they belo
 ## Usage
 ```bash
 $ ./packet2stream --help
--c string
+  -c string
         Mongodb collection name for packets (default "packets")
   -d string
         Mongodb database name (default "traffic")
