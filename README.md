@@ -1,6 +1,6 @@
 # packet2stream
 
-Read in packets from a mongodb collection and tag them with the stream they belong to.
+Read in packets from a MongoDB collection and tag them with the stream they belong to.
 
 ## Usage
 ```
