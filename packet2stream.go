@@ -24,19 +24,23 @@ var database *mongo.Database
 var packetCol *mongo.Collection
 var streamCol *mongo.Collection
 
+const MaxInt64 = int64(^uint64(0) >> 1)
+
 // Stream struct
 type Stream struct {
-	FirstTime      int64
-	LastTime       int64
-	Terminated     bool
-	ClientIp       string
-	ServerIp       string
-	ClientPort     int64
-	ServerPort     int64
-	Protocol       string
-	BaseSeq        int64
-	ClientPayloads [][]byte
-	ServerPayloads [][]byte
+	TimeStart        int64
+	TimeEnd          int64
+	AckReceived      bool
+	FinReceived      bool
+	ClientIp         string
+	ServerIp         string
+	ClientPort       int64
+	ServerPort       int64
+	Protocol         string
+	ClientPayloads   [][]byte
+	ServerPayloads   [][]byte
+	ClientPayloadSeq []int64
+	ServerPayloadSeq []int64
 }
 
 func createStream(stream Stream, packetId primitive.ObjectID) {
@@ -73,7 +77,9 @@ func main() {
 
 	// Get all packets without streams
 	// packetCursor, err := packetCol.Find(ctxTodo, bson.M{"stream": bson.M{"$exists": false}})
-	packetCursor, err := packetCol.Find(ctxTodo, bson.M{})
+	findOptions := options.Find()
+	findOptions.SetSort(bson.D{{Key: "timestamp", Value: 1}})
+	packetCursor, err := packetCol.Find(ctxTodo, bson.M{}, findOptions)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -114,8 +120,9 @@ func main() {
 		protocol := packet["protocol"].(string)
 		tcpflags := packet["tcpflag"].(bson.M)
 		payload = packet["payload"].(primitive.Binary).Data
+		seq := packet["tcpseq"].(int64)
 
-		streamCursor, err := streamCol.Find(ctxTodo, bson.M{"terminated": false, "clientip": clientIp, "serverip": serverIp, "clientport": clientPort, "serverport": serverPort, "protocol": protocol, "lasttime": bson.M{"$lt": timestamp + streamTimeoutMilliseconds}})
+		streamCursor, err := streamCol.Find(ctxTodo, bson.M{"clientip": clientIp, "serverip": serverIp, "clientport": clientPort, "serverport": serverPort, "protocol": protocol, "timestart": bson.M{"$lt": timestamp}, "timeend": bson.M{"$gt": timestamp}})
 
 		// If the packet matches an existing stream, update the stream
 		if err == nil {
@@ -127,22 +134,37 @@ func main() {
 			if err == mongo.ErrNoDocuments || stream["_id"] == nil {
 				// Create a new stream
 				stream := Stream{
-					FirstTime:      timestamp,
-					LastTime:       timestamp,
-					Terminated:     false,
-					ClientIp:       clientIp,
-					ServerIp:       serverIp,
-					ClientPort:     clientPort,
-					ServerPort:     serverPort,
-					Protocol:       protocol,
-					BaseSeq:        packet["tcpseq"].(int64),
-					ClientPayloads: [][]byte{},
-					ServerPayloads: [][]byte{},
+					TimeStart:        timestamp - streamTimeoutMilliseconds,
+					TimeEnd:          timestamp + streamTimeoutMilliseconds,
+					AckReceived:      false,
+					FinReceived:      false,
+					ClientIp:         clientIp,
+					ServerIp:         serverIp,
+					ClientPort:       clientPort,
+					ServerPort:       serverPort,
+					Protocol:         protocol,
+					ClientPayloads:   [][]byte{},
+					ServerPayloads:   [][]byte{},
+					ClientPayloadSeq: []int64{},
+					ServerPayloadSeq: []int64{},
 				}
+
 				if fromClient {
 					stream.ClientPayloads = append(stream.ClientPayloads, payload)
+					stream.ClientPayloadSeq = append(stream.ClientPayloadSeq, packet["tcpseq"].(int64))
 				} else {
 					stream.ServerPayloads = append(stream.ServerPayloads, payload)
+					stream.ServerPayloadSeq = append(stream.ServerPayloadSeq, packet["tcpseq"].(int64))
+				}
+
+				if tcpflags["fin"] == true || tcpflags["rst"] == true {
+					stream.TimeEnd = timestamp
+					stream.FinReceived = true
+				}
+
+				if tcpflags["ack"] == true {
+					stream.TimeStart = timestamp
+					stream.AckReceived = true
 				}
 
 				createStream(stream, packetId)
@@ -153,9 +175,18 @@ func main() {
 			streamPush := bson.M{}
 			streamId := stream["_id"].(primitive.ObjectID)
 
-			if protocol == "tcp" {
-				if tcpflags["fin"] == true || tcpflags["rst"] == true {
-					streamUpdate["terminated"] = true
+			if tcpflags["fin"] == true || tcpflags["rst"] == true {
+				streamUpdate["timeend"] = timestamp
+				streamUpdate["finreceived"] = true
+			} else if tcpflags["ack"] == true {
+				streamUpdate["timestart"] = timestamp
+				streamUpdate["ackreceived"] = true
+			} else {
+				if timestamp+streamTimeoutMilliseconds > stream["timeend"].(int64) {
+					streamUpdate["lasttime"] = timestamp + streamTimeoutMilliseconds
+				}
+				if timestamp-streamTimeoutMilliseconds < stream["timestart"].(int64) {
+					streamUpdate["firsttime"] = timestamp - streamTimeoutMilliseconds
 				}
 			}
 
@@ -165,6 +196,9 @@ func main() {
 				clientPayloads := primitive.A{}
 				serverPayloads := primitive.A{}
 
+				// Key assumption:
+				// The client sends the first payload in the conversation
+				// If this is not true, we add an initial empty payload from the client (so we can make client ans server payloads line up)
 				if stream["clientpayloads"] != nil {
 					clientPayloads = stream["clientpayloads"].(primitive.A)
 				} else if !fromClient {
@@ -180,26 +214,72 @@ func main() {
 					if !lastFromClient || len(clientPayloads) == 0 {
 						// Add a new payload
 						streamPush["clientpayloads"] = payload
+						streamPush["clientpayloadseq"] = seq
 					} else {
-						// Append to the last payload
 						// Concatenate the last payload with the new payload
-						newPayload := make([]byte, len(clientPayloads[len(clientPayloads)-1].(primitive.Binary).Data)+len(payload))
-						copy(newPayload, clientPayloads[len(clientPayloads)-1].(primitive.Binary).Data)
-						copy(newPayload[len(clientPayloads[len(clientPayloads)-1].(primitive.Binary).Data):], payload)
-						streamUpdate[fmt.Sprintf("clientpayloads.%d", len(clientPayloads)-1)] = newPayload
+						payloadIndex := len(clientPayloads) - 1
+
+						existingPayload := clientPayloads[payloadIndex].(primitive.Binary).Data
+						existingStart := stream["clientpayloadseq"].(primitive.A)[payloadIndex].(int64)
+						existingEnd := existingStart + int64(len(existingPayload))
+						newPayload := payload
+						newStart := seq
+						newEnd := newStart + int64(len(newPayload))
+						var mergedStart int64
+						var mergedEnd int64
+						var mergedPayload []byte
+
+						if existingStart < newStart {
+							mergedStart = existingStart
+						} else {
+							mergedStart = newStart
+						}
+						if existingEnd > newEnd {
+							mergedEnd = existingEnd
+						} else {
+							mergedEnd = newEnd
+						}
+						mergedPayload = make([]byte, mergedEnd-mergedStart)
+						copy(mergedPayload[existingStart-mergedStart:], existingPayload)
+						copy(mergedPayload[newStart-mergedStart:], newPayload)
+						streamUpdate[fmt.Sprintf("clientpayloads.%d", payloadIndex)] = mergedPayload
+						streamUpdate[fmt.Sprintf("clientpayloadseq.%d", payloadIndex)] = mergedStart
 					}
 				} else {
 					// Check if last message was also from server
 					if lastFromClient || len(serverPayloads) == 0 {
 						// Append to the last payload
 						streamPush["serverpayloads"] = payload
+						streamPush["serverpayloadseq"] = seq
 					} else {
-						// Add a new payload
 						// Concatenate the last payload with the new payload
-						newPayload := make([]byte, len(serverPayloads[len(serverPayloads)-1].(primitive.Binary).Data)+len(payload))
-						copy(newPayload, serverPayloads[len(serverPayloads)-1].(primitive.Binary).Data)
-						copy(newPayload[len(serverPayloads[len(serverPayloads)-1].(primitive.Binary).Data):], payload)
-						streamUpdate[fmt.Sprintf("serverpayloads.%d", len(serverPayloads)-1)] = newPayload
+						payloadIndex := len(serverPayloads) - 1
+
+						existingPayload := serverPayloads[payloadIndex].(primitive.Binary).Data
+						existingStart := stream["serverpayloadseq"].(primitive.A)[payloadIndex].(int64)
+						existingEnd := existingStart + int64(len(existingPayload))
+						newPayload := payload
+						newStart := seq
+						newEnd := newStart + int64(len(newPayload))
+						var mergedStart int64
+						var mergedEnd int64
+						var mergedPayload []byte
+
+						if existingStart < newStart {
+							mergedStart = existingStart
+						} else {
+							mergedStart = newStart
+						}
+						if existingEnd > newEnd {
+							mergedEnd = existingEnd
+						} else {
+							mergedEnd = newEnd
+						}
+						mergedPayload = make([]byte, mergedEnd-mergedStart)
+						copy(mergedPayload[existingStart-mergedStart:], existingPayload)
+						copy(mergedPayload[newStart-mergedStart:], newPayload)
+						streamUpdate[fmt.Sprintf("serverpayloads.%d", payloadIndex)] = mergedPayload
+						streamUpdate[fmt.Sprintf("serverpayloadseq.%d", payloadIndex)] = mergedStart
 					}
 				}
 			}
@@ -218,22 +298,37 @@ func main() {
 		} else {
 			// If the packet does not match an existing stream, create a new stream
 			stream := Stream{
-				FirstTime:      timestamp,
-				LastTime:       timestamp,
-				Terminated:     false,
-				ClientIp:       clientIp,
-				ServerIp:       serverIp,
-				ClientPort:     clientPort,
-				ServerPort:     serverPort,
-				Protocol:       protocol,
-				BaseSeq:        packet["tcpseq"].(int64),
-				ClientPayloads: [][]byte{},
-				ServerPayloads: [][]byte{},
+				TimeStart:        timestamp - streamTimeoutMilliseconds,
+				TimeEnd:          timestamp + streamTimeoutMilliseconds,
+				AckReceived:      false,
+				FinReceived:      false,
+				ClientIp:         clientIp,
+				ServerIp:         serverIp,
+				ClientPort:       clientPort,
+				ServerPort:       serverPort,
+				Protocol:         protocol,
+				ClientPayloads:   [][]byte{},
+				ServerPayloads:   [][]byte{},
+				ClientPayloadSeq: []int64{},
+				ServerPayloadSeq: []int64{},
 			}
+
 			if fromClient {
 				stream.ClientPayloads = append(stream.ClientPayloads, payload)
+				stream.ClientPayloadSeq = append(stream.ClientPayloadSeq, packet["tcpseq"].(int64))
 			} else {
 				stream.ServerPayloads = append(stream.ServerPayloads, payload)
+				stream.ServerPayloadSeq = append(stream.ServerPayloadSeq, packet["tcpseq"].(int64))
+			}
+
+			if tcpflags["fin"] == true || tcpflags["rst"] == true {
+				stream.TimeEnd = timestamp
+				stream.FinReceived = true
+			}
+
+			if tcpflags["ack"] == true {
+				stream.TimeStart = timestamp
+				stream.AckReceived = true
 			}
 
 			createStream(stream, packetId)
